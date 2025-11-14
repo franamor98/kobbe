@@ -1,4 +1,4 @@
-# `kobbe`
+# `kobbe` - Fork and continuation of development.
 
 ![](docs/images/logos_illustrations/kobbe_header.png)
 
