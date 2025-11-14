@@ -1,4 +1,7 @@
-# `kobbe` - Fork and continuation of development.
+# `kobbe` 
+### Fork and continuation of development. For ICEWISE project.
+### Credits to Øyvind Foss @oyvfoss, main developer of this tool.
+
 
 ![](docs/images/logos_illustrations/kobbe_header.png)
 
