@@ -428,7 +428,7 @@ def overview(ds: xr.Dataset) -> None:
 ##############################################################################
 
 
-def _reshape_ensembles(
+def _reshape_ensembles_old(
         ds: xr.Dataset,
         time_threshold_min: Union[bool, float] = None) -> xr.Dataset:
     """
@@ -556,6 +556,129 @@ def _reshape_ensembles(
 
 ##############################################################################
 
+
+
+
+def _reshape_ensembles(
+        ds: xr.Dataset,
+        time_threshold_min: Union[bool, float] = None) -> xr.Dataset:
+    """
+    Reshape from per-ping 'time_average' to ('TIME','SAMPLE') per-ensemble.
+    Uses time gaps to segment, then keeps groups matching the *modal* group size.
+    """
+
+    if "time_average" not in ds.dims:
+        raise ValueError("Dataset must contain the 'time_average' dimension.")
+
+    # 1) nominal samples/ensemble from config (may be wrong for parts of the record)
+    nominal = int(ds.attrs.get("samples_per_ensemble", 0)) or None
+
+    # 2) pick threshold
+    if time_threshold_min is None:
+        time_threshold_min = _guess_time_separation(ds)
+    thr_days = time_threshold_min / (24 * 60)
+
+    # 3) group by time gaps
+    t = ds.time_average.data
+    Nt = t.size
+    if Nt == 0:
+        raise ValueError("No time samples in 'time_average'.")
+    d = np.diff(t)
+    breaks = np.where(d > thr_days)[0] + 1
+    groups = np.split(np.arange(Nt), breaks)
+    sizes = np.array([len(g) for g in groups], dtype=int)
+
+    # 4) choose effective Nsamp as the MODE of group sizes (>=2 to avoid noise)
+    vals, cnts = np.unique(sizes, return_counts=True)
+    # ignore tiny groups (e.g., singletons due to glitches)
+    mask = vals >= 2
+    if not np.any(mask):
+        raise ValueError("No usable groups found; adjust 'time_threshold_min'.")
+    vals, cnts = vals[mask], cnts[mask]
+    Nsamp_eff = int(vals[np.argmax(cnts)])
+
+    # optional: if a nominal value exists and is close, prefer it
+    if nominal is not None and abs(nominal - Nsamp_eff) <= max(1, int(0.05*Nsamp_eff)):
+        Nsamp_eff = nominal
+
+    # 5) keep groups whose size == Nsamp_eff (or within tolerance)
+    tol = 0  # set to 1 to allow +/-1
+    keep = [g for g in groups if abs(len(g) - Nsamp_eff) <= tol]
+    dropped = len(groups) - len(keep)
+    if not keep:
+        raise ValueError(
+            f"No groups match effective ensemble size {Nsamp_eff}. "
+            f"Try a different 'time_threshold_min'."
+        )
+    if dropped > 0:
+        import warnings
+        warnings.warn(
+            f"Keeping {len(keep)} groups of size {Nsamp_eff}; "
+            f"dropped {dropped} nonconforming groups."
+        )
+
+    Nens = len(keep)
+    keep_idx = np.concatenate(keep)
+    t_ens = np.array([t[g].mean() for g in keep])
+    SAMPLE = np.arange(1, Nsamp_eff + 1, dtype=float)
+
+    print(f"{Nt} pings -> {Nens} ensembles of {Nsamp_eff} samples "
+          f"(threshold {time_threshold_min} min)")
+
+    # 6) build coords
+    rsh_coords = dict(ds.coords)
+    rsh_coords.pop("time_average", None)
+    rsh_coords["TIME"] = (
+        ["TIME"], t_ens,
+        {"standard_name":"time","units":"Days since 1970-01-01",
+         "long_name":"Time stamp of the ensemble averaged measurement","axis":"T"}
+    )
+    rsh_coords["SAMPLE"] = (
+        ["SAMPLE"], SAMPLE,
+        {"units":"1","long_name":"Sample number in ensemble",
+         "comment": f"{Nsamp_eff} samples per ensemble"}
+    )
+
+    ds_rsh = xr.Dataset(coords=rsh_coords)
+    ds_rsh.attrs = ds.attrs
+    if "instrument_configuration_details" in ds_rsh.attrs:
+        del ds_rsh.attrs["instrument_configuration_details"]
+    ds_rsh.attrs["instrument_configuration_details"] = ds.attrs.get(
+        "instrument_configuration_details","N/A"
+    )
+
+    # 7) move variables (index with keep_idx BEFORE reshape)
+    for var_ in ds.variables:
+        dims = ds[var_].dims
+        data = ds[var_].data
+        attrs = ds[var_].attrs
+
+        if dims == ("time_average",):
+            data_sel = data[keep_idx]
+            reshaped = np.ma.reshape(data_sel, (Nens, Nsamp_eff))
+            ds_rsh[var_] = (("TIME","SAMPLE"), reshaped, attrs)
+
+        elif dims == ("VEL_BIN","time_average"):
+            data_sel = data[:, keep_idx]
+            reshaped = np.ma.reshape(data_sel, (ds.sizes["VEL_BIN"], Nens, Nsamp_eff))
+            x = xr.DataArray(reshaped, dims=("VEL_BIN","TIME","SAMPLE"), attrs=attrs)
+            ds_rsh[var_] = x.transpose("TIME","VEL_BIN","SAMPLE")
+
+        elif dims == ("time_average","xyz"):
+            data_sel = data[keep_idx, :]
+            reshaped = np.ma.reshape(data_sel, (Nens, Nsamp_eff, ds.sizes["xyz"]))
+            ds_rsh[var_] = (("TIME","SAMPLE","xyz"), reshaped, attrs)
+
+        elif dims == ("time_average","beams"):
+            data_sel = data[keep_idx, :]
+            reshaped = np.ma.reshape(data_sel, (Nens, Nsamp_eff, ds.sizes["beams"]))
+            ds_rsh[var_] = (("TIME","SAMPLE","beams"), reshaped, attrs)
+
+        else:
+            if "time_average" not in dims:
+                ds_rsh[var_] = (dims, data, attrs)
+
+    return ds_rsh
 
 def _matfile_to_dataset(
     filename: str,
